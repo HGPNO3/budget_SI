@@ -31,7 +31,7 @@ def filter_redundant_turns(info_gain_path):
     print("=== ORIGINAL DIALOGUE ===")
     for t in turns:
         marker = " " if t["label"] == "useful" else "X" if t["label"] == "redundant" else "~"
-        print(f"  [{marker}] {t['role']}: {t['content'][:80]}...")
+        print(f"  [{marker}] {t['sender']}: {t['content'][:80]}...")
     print()
 
     # Filtered dialogue (remove redundant, keep useful + neutral)
@@ -39,7 +39,7 @@ def filter_redundant_turns(info_gain_path):
 
     print(f"=== FILTERED DIALOGUE ({len(filtered)} turns) ===")
     for t in filtered:
-        print(f"  [+] {t['role']}: {t['content'][:80]}...")
+        print(f"  [+] {t['sender']}: {t['content'][:80]}...")
     print()
 
     reduction = (1 - len(filtered) / max(len(turns), 1)) * 100
@@ -56,11 +56,11 @@ def filter_redundant_turns(info_gain_path):
         "filtered_turn_count": len(filtered),
         "reduction_rate": reduction / 100,
         "original_dialogue": [
-            {"role": t["role"], "content": t["content"], "label": t["label"]}
+            {"sender": t["sender"], "content": t["content"], "label": t["label"]}
             for t in turns
         ],
         "filtered_dialogue": [
-            {"role": t["role"], "content": t["content"]}
+            {"sender": t["sender"], "content": t["content"]}
             for t in filtered
         ],
     }

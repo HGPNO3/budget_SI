@@ -34,7 +34,7 @@ def build_dialogue_prefix(turns, up_to_index):
     """Build dialogue text from turn 0 to up_to_index (inclusive)."""
     lines = []
     for t in turns[:up_to_index + 1]:
-        lines.append(f"{t['role']}: {t['content']}")
+        lines.append(f"{t.get('sender', t.get('role', 'Unknown'))}: {t['content']}")
     return "\n".join(lines)
 
 
@@ -124,7 +124,7 @@ def compute_info_gain(episode_path):
         info_gains.append(ig)
 
         label = "USEFUL" if ig > 0 else ("NEUTRAL" if ig == 0 else "REDUNDANT")
-        role = turns[k]["role"]
+        role = turns[k]["sender"]
         content_preview = turns[k]["content"][:60]
         print(f"  Turn {k:2d} | {role:20s} | score={score:5.1f} | IG={ig:+6.2f} | {label:9s} | {content_preview}...")
 
@@ -157,7 +157,7 @@ def compute_info_gain(episode_path):
     for k, turn in enumerate(turns):
         result["turns"].append({
             "turn_index": k,
-            "role": turn["role"],
+            "sender": turn["sender"],
             "content": turn["content"],
             "predicted_score": scores[k],
             "info_gain": info_gains[k],

@@ -41,13 +41,21 @@ def episode_to_dict(episode):
     """Convert an EpisodeLog to a clean dictionary."""
     # Extract turn-by-turn messages
     turns = []
-    # episode.messages is a list of list of tuples: [[(role, content), ...], ...]
+    # episode.messages is a list of list of tuples: [[(sender, receiver, content), ...], ...]
     for turn_idx, turn_messages in enumerate(episode.messages):
-        for role, content in turn_messages:
+        for msg in turn_messages:
+            if len(msg) == 3:
+                sender, receiver, content = msg
+            elif len(msg) == 2:
+                sender, content = msg
+                receiver = ""
+            else:
+                continue
             if content.strip():
                 turns.append({
                     "turn": turn_idx,
-                    "role": role,
+                    "sender": sender,
+                    "receiver": receiver,
                     "content": content,
                 })
 
@@ -98,30 +106,29 @@ def determine_winner(episode_dict):
     Determine which agent 'won' based on goal scores from rewards.
     Returns the winner's index and name.
     """
-    rewards = episode_dict.get("rewards", {})
+    rewards = episode_dict.get("rewards", [])
     if not rewards:
         return None, None
 
-    # rewards structure varies; try to extract goal scores
+    # rewards is a list of (overall_score, {dimension_dict}) per agent
     best_score = -float('inf')
-    winner_key = None
+    winner_idx = None
 
-    for agent_key, reward_data in rewards.items():
-        # reward_data might be a list of dimension scores
-        # Goal is typically the last dimension evaluated
-        if isinstance(reward_data, (list, tuple)):
-            # Try to get the goal score (usually the last one or a specific index)
-            score = sum(reward_data) if reward_data else 0
-        elif isinstance(reward_data, (int, float)):
-            score = reward_data
+    for i, reward_entry in enumerate(rewards):
+        if isinstance(reward_entry, (list, tuple)) and len(reward_entry) == 2:
+            overall_score, dims = reward_entry
+            # Use goal score as the primary metric
+            goal_score = dims.get("goal", overall_score) if isinstance(dims, dict) else overall_score
+        elif isinstance(reward_entry, (int, float)):
+            goal_score = reward_entry
         else:
             continue
 
-        if score > best_score:
-            best_score = score
-            winner_key = agent_key
+        if goal_score > best_score:
+            best_score = goal_score
+            winner_idx = i
 
-    return winner_key, best_score
+    return winner_idx, best_score
 
 
 async def main():
@@ -171,7 +178,7 @@ async def main():
     # Print a preview of the dialogue
     print("\n--- Dialogue Preview ---")
     for turn in episode_dict["turns"][:6]:
-        role = turn["role"]
+        role = turn["sender"]
         content = turn["content"][:100]
         print(f"  [{turn['turn']}] {role}: {content}...")
 
