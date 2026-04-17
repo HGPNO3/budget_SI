@@ -134,7 +134,7 @@ def main(info_gain_path):
 
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name()}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     # 1. Load model + tokenizer
     print(f"\nLoading model: {MODEL_ID}")
