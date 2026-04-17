@@ -144,7 +144,7 @@ def main(info_gain_path):
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map="auto",
     )
 
@@ -155,7 +155,7 @@ def main(info_gain_path):
         r=16,
         lora_alpha=32,
         lora_dropout=0.05,
-        target_modules=["q_proj", "v_proj"],
+        target_modules="all-linear",
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
