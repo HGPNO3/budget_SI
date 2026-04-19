@@ -216,6 +216,7 @@ async def main():
                 },
                 sampler=sampler,
                 push_to_db=True,
+                tag="budget_si",
             )
         except Exception as e:
             print(f"  [ERROR] Episode failed: {e}")
