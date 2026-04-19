@@ -1,18 +1,22 @@
 """
-Step 1: Generate one sotopia episode and save structured data to JSON.
+Step 1: Generate sotopia episodes and save structured data.
+
+Supports single run or batch mode with specific scene IDs.
 
 Usage:
-    conda activate lx_sotopia
-    export REDIS_OM_URL="redis://localhost:6380"
-    export OPENAI_API_BASE="http://localhost:8001/v1"
-    export OPENAI_API_KEY="EMPTY"
+    # Single random episode
     python step1_generate_episode.py
 
-Output: data/episode_<timestamp>.json
+    # Batch mode with filtered scenes
+    python step1_generate_episode.py --scenes data/filtered_scenes.json --count 10
+
+Output: data/episode_<timestamp>.json (per episode)
 """
+import argparse
 import asyncio
 import json
 import os
+import random
 import time
 from datetime import datetime
 
@@ -32,17 +36,30 @@ def get_latest_episode_from_redis():
     episodes = EpisodeLog.find().all()
     if not episodes:
         return None
-    # Sort by pk (ULID, lexicographically ordered by time)
     episodes.sort(key=lambda e: e.pk, reverse=True)
     return episodes[0]
 
 
-def episode_to_dict(episode):
-    """Convert an EpisodeLog to a clean dictionary."""
-    # Extract turn-by-turn messages
-    turns = []
-    # episode.messages is a list of list of tuples: [[(sender, receiver, content), ...], ...]
-    for turn_idx, turn_messages in enumerate(episode.messages):
+def extract_rounds(messages):
+    """
+    Convert raw sotopia messages into structured rounds.
+
+    A round = one complete turn in sotopia (A speaks + B responds).
+    Environment messages are stored as context but not counted as dialogue.
+
+    Returns list of dicts:
+    {
+        "round_idx": int,
+        "agent_messages": [{"sender": str, "content": str}, ...],
+        "dialogue_text": str,  # A and B's actual speech concatenated
+    }
+    """
+    rounds = []
+
+    for turn_idx, turn_messages in enumerate(messages):
+        agent_msgs = []
+        env_context = []
+
         for msg in turn_messages:
             if len(msg) == 3:
                 sender, receiver, content = msg
@@ -51,34 +68,90 @@ def episode_to_dict(episode):
                 receiver = ""
             else:
                 continue
-            if content.strip():
-                turns.append({
-                    "turn": turn_idx,
+
+            if not content.strip():
+                continue
+
+            if sender == "Environment":
+                env_context.append(content)
+            else:
+                agent_msgs.append({
                     "sender": sender,
-                    "receiver": receiver,
                     "content": content,
                 })
 
-    # Extract rewards/scores
+        # Build dialogue text for this round (only agent speech)
+        dialogue_parts = []
+        for am in agent_msgs:
+            if "did nothing" not in am["content"] and "left the conversation" not in am["content"]:
+                dialogue_parts.append(f"{am['sender']}: {am['content']}")
+
+        rounds.append({
+            "round_idx": turn_idx,
+            "agent_messages": agent_msgs,
+            "dialogue_text": "\n".join(dialogue_parts),
+            "has_speech": len(dialogue_parts) > 0,
+        })
+
+    return rounds
+
+
+def determine_winner(rewards, agents):
+    """
+    Determine winner by comparing goal scores.
+    Returns (winner_key, winner_goal_score, loser_key, loser_goal_score) or Nones if tie/invalid.
+    """
+    if not rewards:
+        return None, None, None, None
+
+    scores = {}
+    items = rewards.items() if isinstance(rewards, dict) else enumerate(rewards)
+    for key, reward_entry in items:
+        if isinstance(reward_entry, (list, tuple)) and len(reward_entry) == 2:
+            overall_score, dims = reward_entry
+            goal_score = dims.get("goal", overall_score) if isinstance(dims, dict) else overall_score
+        elif isinstance(reward_entry, (int, float)):
+            goal_score = reward_entry
+        else:
+            continue
+        scores[key] = goal_score
+
+    if len(scores) < 2:
+        return None, None, None, None
+
+    sorted_agents = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    winner_key, winner_score = sorted_agents[0]
+    loser_key, loser_score = sorted_agents[1]
+
+    # Require a gap to declare a winner (no ties)
+    if winner_score <= loser_score:
+        return None, None, None, None
+
+    return winner_key, winner_score, loser_key, loser_score
+
+
+def episode_to_dict(episode):
+    """Convert an EpisodeLog to a clean dictionary with structured rounds."""
+    rounds = extract_rounds(episode.messages)
+
+    # Extract rewards
     rewards = {}
     if episode.rewards:
         for i, reward_list in enumerate(episode.rewards):
-            agent_name = f"agent_{i}"
-            if hasattr(episode, 'agents') and episode.agents:
-                agent_name = episode.agents[i]
-            rewards[agent_name] = reward_list
+            agent_key = episode.agents[i] if hasattr(episode, 'agents') and episode.agents else f"agent_{i}"
+            rewards[agent_key] = reward_list
 
     result = {
         "pk": episode.pk,
         "environment": episode.environment,
         "agents": episode.agents if hasattr(episode, 'agents') else [],
-        "turns": turns,
+        "rounds": rounds,
         "rewards": rewards,
         "models": episode.models if hasattr(episode, 'models') else [],
         "timestamp": datetime.now().isoformat(),
     }
 
-    # Try to get agent profiles and environment profile for context
+    # Get environment profile
     try:
         env_profile = EnvironmentProfile.get(episode.environment)
         result["scenario"] = env_profile.scenario
@@ -86,6 +159,7 @@ def episode_to_dict(episode):
     except Exception:
         pass
 
+    # Get agent profiles
     try:
         agent_profiles = []
         for agent_pk in episode.agents:
@@ -98,53 +172,35 @@ def episode_to_dict(episode):
     except Exception:
         pass
 
+    # Determine winner
+    winner_key, winner_score, loser_key, loser_score = determine_winner(rewards, result.get("agents", []))
+    result["winner"] = winner_key
+    result["winner_score"] = winner_score
+    result["loser"] = loser_key
+    result["loser_score"] = loser_score
+    result["has_winner"] = winner_key is not None
+
+    # Add winner name
+    if winner_key and "agent_profiles" in result:
+        for p in result["agent_profiles"]:
+            if p["pk"] == winner_key:
+                result["winner_name"] = p["name"]
+            elif loser_key and p["pk"] == loser_key:
+                result["loser_name"] = p["name"]
+
+    # Build GT text for info gain computation
+    if result.get("winner_name") and result.get("agent_goals"):
+        for i, agent_pk in enumerate(result.get("agents", [])):
+            if agent_pk == winner_key and i < len(result["agent_goals"]):
+                goal = result["agent_goals"][i]
+                result["gt_text"] = f"{result['winner_name']} successfully achieved their goal: {goal}"
+                break
+
     return result
 
 
-def determine_winner(episode_dict):
-    """
-    Determine which agent 'won' based on goal scores from rewards.
-    Returns the winner's index and name.
-    """
-    rewards = episode_dict.get("rewards", [])
-    if not rewards:
-        return None, None
-
-    # rewards is a list of (overall_score, {dimension_dict}) per agent
-    best_score = -float('inf')
-    winner_idx = None
-
-    for i, reward_entry in enumerate(rewards):
-        if isinstance(reward_entry, (list, tuple)) and len(reward_entry) == 2:
-            overall_score, dims = reward_entry
-            # Use goal score as the primary metric
-            goal_score = dims.get("goal", overall_score) if isinstance(dims, dict) else overall_score
-        elif isinstance(reward_entry, (int, float)):
-            goal_score = reward_entry
-        else:
-            continue
-
-        if goal_score > best_score:
-            best_score = goal_score
-            winner_idx = i
-
-    return winner_idx, best_score
-
-
-async def main():
-    os.makedirs(config.DATA_DIR, exist_ok=True)
-
-    # Count episodes before running
-    try:
-        episodes_before = len(EpisodeLog.find().all())
-    except Exception:
-        episodes_before = 0
-
-    print(f"[Step 1] Running one sotopia episode...")
-    print(f"  Model: {config.VLLM_MODEL_NAME}")
-    print(f"  Episodes in Redis before: {episodes_before}")
-
-    # Run one episode
+async def run_single_episode():
+    """Run one episode with random sampling."""
     await run_async_server(
         model_dict={
             "env": config.VLLM_MODEL_NAME,
@@ -154,38 +210,58 @@ async def main():
         sampler=UniformSampler(),
     )
 
-    # Retrieve the episode from Redis
-    episode = get_latest_episode_from_redis()
-    if episode is None:
-        print("[ERROR] No episode found in Redis after running.")
-        return
 
-    episode_dict = episode_to_dict(episode)
-    winner, score = determine_winner(episode_dict)
-    episode_dict["winner"] = winner
-    episode_dict["winner_score"] = score
+async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--scenes", help="Path to filtered_scenes.json")
+    parser.add_argument("--count", type=int, default=1, help="Number of episodes to generate")
+    args = parser.parse_args()
 
-    # Save to file
-    timestamp = int(time.time())
-    filepath = os.path.join(config.DATA_DIR, f"episode_{timestamp}.json")
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(episode_dict, f, ensure_ascii=False, indent=2)
+    os.makedirs(config.DATA_DIR, exist_ok=True)
 
-    print(f"\n[Step 1] Episode saved to: {filepath}")
-    print(f"  Turns: {len(episode_dict['turns'])}")
-    print(f"  Winner: {winner} (score: {score})")
+    total = args.count
+    saved = 0
+    skipped = 0
 
-    # Print a preview of the dialogue
-    print("\n--- Dialogue Preview ---")
-    for turn in episode_dict["turns"][:6]:
-        role = turn["sender"]
-        content = turn["content"][:100]
-        print(f"  [{turn['turn']}] {role}: {content}...")
+    for i in range(total):
+        print(f"\n{'='*60}")
+        print(f"[Step 1] Episode {i+1}/{total}")
+        print(f"{'='*60}")
 
-    if len(episode_dict["turns"]) > 6:
-        print(f"  ... ({len(episode_dict['turns']) - 6} more turns)")
+        await run_single_episode()
 
-    return filepath
+        episode = get_latest_episode_from_redis()
+        if episode is None:
+            print("[WARN] No episode found, skipping.")
+            skipped += 1
+            continue
+
+        episode_dict = episode_to_dict(episode)
+
+        # Save
+        timestamp = int(time.time())
+        filepath = os.path.join(config.DATA_DIR, f"episode_{timestamp}.json")
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(episode_dict, f, ensure_ascii=False, indent=2)
+
+        has_winner = episode_dict.get("has_winner", False)
+        winner_name = episode_dict.get("winner_name", "None")
+        n_rounds = len(episode_dict["rounds"])
+        speech_rounds = sum(1 for r in episode_dict["rounds"] if r["has_speech"])
+
+        status = "HAS WINNER" if has_winner else "NO WINNER (tie/fail)"
+        print(f"  Saved: {filepath}")
+        print(f"  Rounds: {n_rounds} total, {speech_rounds} with speech")
+        print(f"  Status: {status}")
+        if has_winner:
+            print(f"  Winner: {winner_name} (goal={episode_dict['winner_score']})")
+            print(f"  GT: {episode_dict.get('gt_text', 'N/A')[:80]}...")
+
+        saved += 1
+
+    print(f"\n{'='*60}")
+    print(f"[Step 1] Done. Saved: {saved}, Skipped: {skipped}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

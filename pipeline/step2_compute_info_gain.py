@@ -1,11 +1,14 @@
 """
-Step 2: Compute information gain per turn.
+Step 2: Compute information gain per round.
 
-For each turn k in the dialogue:
-  - Build context = dialogue turns 1..k
-  - Ask model: "Will [winner] achieve their goal?" → get predicted score
-  - Info gain = predicted_score[k] - predicted_score[k-1]
-  - Label turns with info_gain <= 0 as "redundant"
+A round = one complete sotopia turn (A speaks + B responds).
+For each round k:
+  - Build context = all dialogue from rounds 0..k
+  - Measure how much this round increased P(winner achieves goal)
+  - IG = predicted_score[k] - predicted_score[k-1]
+
+Current version: simple (ask model to predict 0-10).
+TODO: upgrade to IGPO token log-prob method (see Task #13).
 
 Usage:
     conda activate lx_sotopia
@@ -30,33 +33,34 @@ client = OpenAI(
 )
 
 
-def build_dialogue_prefix(turns, up_to_index):
-    """Build dialogue text from turn 0 to up_to_index (inclusive)."""
-    lines = []
-    for t in turns[:up_to_index + 1]:
-        lines.append(f"{t.get('sender', t.get('role', 'Unknown'))}: {t['content']}")
-    return "\n".join(lines)
-
-
-def predict_goal_score(dialogue_text, winner_name, goal_description):
+def build_dialogue_up_to_round(rounds, up_to_idx):
     """
-    Ask the model to predict the winner's goal achievement score
-    given a partial dialogue.
-    Returns a float score (0-10).
+    Build cumulative dialogue text from round 0 to up_to_idx (inclusive).
+    Only includes rounds that have actual speech.
     """
-    prompt = f"""You are an expert evaluator of social conversations.
+    parts = []
+    for r in rounds[:up_to_idx + 1]:
+        if r["dialogue_text"]:
+            parts.append(r["dialogue_text"])
+    return "\n".join(parts)
 
-Scenario context: Two agents are having a conversation.
-{winner_name}'s goal is: {goal_description}
 
-Here is the conversation so far:
----
-{dialogue_text}
----
+def predict_goal_achievement(dialogue_text, winner_name, goal_description):
+    """
+    Ask the model: given the dialogue so far, how likely is the winner
+    to achieve their goal? Returns a float score (0-10).
 
-Based ONLY on the conversation above, how likely is {winner_name} to achieve their goal?
-Rate from 0 (will definitely fail) to 10 (will definitely succeed).
-Respond with ONLY a single number, nothing else."""
+    This is the SIMPLE version. Will be replaced by IGPO token log-prob.
+    """
+    prompt = (
+        f"You are an expert evaluator of social conversations.\n\n"
+        f"{winner_name}'s goal is: {goal_description}\n\n"
+        f"Conversation so far:\n---\n{dialogue_text}\n---\n\n"
+        f"Based ONLY on the conversation above, how likely is {winner_name} "
+        f"to achieve their goal?\n"
+        f"Rate from 0 (will definitely fail) to 10 (will definitely succeed).\n"
+        f"Respond with ONLY a single number, nothing else."
+    )
 
     try:
         response = client.chat.completions.create(
@@ -66,99 +70,99 @@ Respond with ONLY a single number, nothing else."""
             temperature=0.0,
         )
         text = response.choices[0].message.content.strip()
-        # Extract number from response
         match = re.search(r'(\d+(?:\.\d+)?)', text)
         if match:
-            score = float(match.group(1))
-            return min(max(score, 0.0), 10.0)
-        return 5.0  # default if parsing fails
+            return min(max(float(match.group(1)), 0.0), 10.0)
+        return 5.0
     except Exception as e:
         print(f"  [WARN] API call failed: {e}")
         return 5.0
 
 
 def compute_info_gain(episode_path):
-    """Main function: compute info gain for each turn in an episode."""
+    """Compute info gain for each round in an episode."""
     with open(episode_path, "r", encoding="utf-8") as f:
         episode = json.load(f)
 
-    turns = episode["turns"]
-    winner = episode.get("winner")
-    agent_profiles = episode.get("agent_profiles", [])
-    agent_goals = episode.get("agent_goals", [])
+    # Check if episode has a winner
+    if not episode.get("has_winner"):
+        print(f"[SKIP] No winner in {episode_path}. Cannot compute IG.")
+        return None
 
-    # Determine winner's name and goal
-    winner_name = "the winner"
-    goal_description = "achieve their social goal"
+    rounds = episode["rounds"]
+    winner_name = episode.get("winner_name", "Unknown")
+    gt_text = episode.get("gt_text", "")
 
-    if agent_profiles:
-        # winner is like "agent_0" or an agent pk
-        for i, profile in enumerate(agent_profiles):
-            if winner and (f"agent_{i}" == winner or profile.get("pk") == winner):
-                winner_name = profile.get("name", winner_name)
-                if agent_goals and i < len(agent_goals):
-                    goal_description = agent_goals[i]
-                break
+    # Extract goal description from gt_text
+    goal_description = gt_text.replace(f"{winner_name} successfully achieved their goal: ", "") if gt_text else "achieve their social goal"
 
     print(f"[Step 2] Computing info gain for: {episode_path}")
     print(f"  Winner: {winner_name}")
     print(f"  Goal: {goal_description[:80]}...")
-    print(f"  Total turns: {len(turns)}")
+    print(f"  Total rounds: {len(rounds)}")
+
+    # Filter to rounds that have actual speech
+    speech_rounds = [r for r in rounds if r["has_speech"]]
+    print(f"  Rounds with speech: {len(speech_rounds)}")
     print()
 
-    # Compute predicted score at each turn
+    # Compute predicted score at each round
     scores = []
     info_gains = []
 
-    # Group turns into "rounds" — each round = one complete exchange
-    # We evaluate after each individual turn (both A and B contributions matter)
-    for k in range(len(turns)):
-        dialogue_text = build_dialogue_prefix(turns, k)
-        score = predict_goal_score(dialogue_text, winner_name, goal_description)
+    for k in range(len(speech_rounds)):
+        dialogue_text = build_dialogue_up_to_round(speech_rounds, k)
+        score = predict_goal_achievement(dialogue_text, winner_name, goal_description)
         scores.append(score)
 
-        if k == 0:
-            ig = 0.0  # no previous turn to compare
-        else:
-            ig = score - scores[k - 1]
+        ig = 0.0 if k == 0 else score - scores[k - 1]
         info_gains.append(ig)
 
         label = "USEFUL" if ig > 0 else ("NEUTRAL" if ig == 0 else "REDUNDANT")
-        role = turns[k]["sender"]
-        content_preview = turns[k]["content"][:60]
-        print(f"  Turn {k:2d} | {role:20s} | score={score:5.1f} | IG={ig:+6.2f} | {label:9s} | {content_preview}...")
+        round_idx = speech_rounds[k]["round_idx"]
 
-    # Summary statistics
+        # Show who spoke in this round
+        speakers = [m["sender"] for m in speech_rounds[k]["agent_messages"]
+                     if "did nothing" not in m["content"] and "left the conversation" not in m["content"]]
+        speakers_str = " & ".join(speakers) if speakers else "(no speech)"
+        preview = speech_rounds[k]["dialogue_text"][:60].replace("\n", " ")
+
+        print(f"  Round {round_idx:2d} | {speakers_str:30s} | score={score:5.1f} | IG={ig:+6.2f} | {label:9s} | {preview}...")
+
+    # Summary
     useful = sum(1 for ig in info_gains if ig > 0)
     redundant = sum(1 for ig in info_gains if ig < 0)
     neutral = sum(1 for ig in info_gains if ig == 0)
 
     print(f"\n--- Summary ---")
-    print(f"  Useful turns:    {useful}/{len(turns)}")
-    print(f"  Redundant turns: {redundant}/{len(turns)}")
-    print(f"  Neutral turns:   {neutral}/{len(turns)}")
-    print(f"  Redundancy rate: {redundant/max(len(turns),1)*100:.1f}%")
+    print(f"  Speech rounds: {len(speech_rounds)}")
+    print(f"  Useful (IG > 0):    {useful}")
+    print(f"  Redundant (IG < 0): {redundant}")
+    print(f"  Neutral (IG = 0):   {neutral}")
+    print(f"  Redundancy rate: {redundant/max(len(speech_rounds),1)*100:.1f}%")
 
-    # Save results
+    # Build result
     result = {
         "episode_path": episode_path,
         "winner_name": winner_name,
         "goal_description": goal_description,
-        "turns": [],
+        "gt_text": gt_text,
+        "rounds": [],
         "summary": {
-            "total_turns": len(turns),
+            "total_rounds": len(rounds),
+            "speech_rounds": len(speech_rounds),
             "useful": useful,
             "redundant": redundant,
             "neutral": neutral,
-            "redundancy_rate": redundant / max(len(turns), 1),
+            "redundancy_rate": redundant / max(len(speech_rounds), 1),
         },
     }
 
-    for k, turn in enumerate(turns):
-        result["turns"].append({
-            "turn_index": k,
-            "sender": turn["sender"],
-            "content": turn["content"],
+    for k, sr in enumerate(speech_rounds):
+        result["rounds"].append({
+            "round_idx": sr["round_idx"],
+            "agent_messages": sr["agent_messages"],
+            "dialogue_text": sr["dialogue_text"],
             "predicted_score": scores[k],
             "info_gain": info_gains[k],
             "label": "useful" if info_gains[k] > 0 else ("neutral" if info_gains[k] == 0 else "redundant"),
@@ -174,11 +178,11 @@ def compute_info_gain(episode_path):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
+        import glob
         print("Usage: python step2_compute_info_gain.py data/episode_XXXX.json")
         print("\nAvailable episodes:")
-        import glob
         for f in sorted(glob.glob(f"{config.DATA_DIR}/episode_*.json")):
-            if "info_gain" not in f:
+            if "info_gain" not in f and "filtered" not in f:
                 print(f"  {f}")
         sys.exit(1)
 
