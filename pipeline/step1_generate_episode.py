@@ -215,6 +215,7 @@ async def main():
                     "agent2": config.VLLM_MODEL_NAME,
                 },
                 sampler=sampler,
+                push_to_db=True,
             )
         except Exception as e:
             print(f"  [ERROR] Episode failed: {e}")
