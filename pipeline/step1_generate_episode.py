@@ -29,9 +29,14 @@ from sotopia.server import run_async_server
 import config
 
 
-def get_latest_episode_from_redis():
-    """Query Redis for the most recently saved EpisodeLog."""
-    episodes = EpisodeLog.find().all()
+def get_latest_episode_from_redis(tag="budget_si"):
+    """Query Redis for the most recently saved EpisodeLog with our tag.
+
+    Note: EpisodeLog.find().all() has a MAXSEARCHRESULTS=10000 limit.
+    The sotopia-pi dataset has 10000+ episodes, so unfiltered queries
+    won't return our new episodes. Always filter by tag.
+    """
+    episodes = EpisodeLog.find(EpisodeLog.tag == tag).all()
     if not episodes:
         return None
     episodes.sort(key=lambda e: e.pk, reverse=True)
